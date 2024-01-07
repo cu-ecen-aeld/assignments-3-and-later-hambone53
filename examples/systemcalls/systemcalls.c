@@ -1,4 +1,10 @@
 #include "systemcalls.h"
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -16,8 +22,15 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
+    if (cmd == NULL) {
+        return false;
+    }
 
-    return true;
+    if (WIFEXITED(system(cmd))) {
+        return true;
+    } else {
+        return false;
+    }
 }
 
 /**
@@ -40,14 +53,13 @@ bool do_exec(int count, ...)
     va_start(args, count);
     char * command[count+1];
     int i;
+    int childPID, wstatus, exeReturn;
+
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
 
 /*
  * TODO:
@@ -58,9 +70,50 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    fflush(stdout);
+
+    printf("Forking\n");
+    if ((childPID = fork()) == -1) {
+        //failed to fork
+        printf("Fork failed\n");
+        return false;
+    }
+    else if (childPID == 0) {
+        // Child Process
+        printf("Child process about to run command\n");
+        if ((exeReturn = execv(command[0], command)) == -1) {
+            // Failed to run execv syscall
+            printf("execv command failed to run\n");
+            _exit(1);
+        }
+    }
+    else {
+        // Parent Process
+        printf("Parent process waiting\n");
+        if (wait(&wstatus) == -1) {
+            // Wait failed
+            printf("Wait failed\n");
+            return false;
+        }
+        else {
+            if (WIFEXITED(wstatus) != 0) {
+                // Child process ended correctly
+                // Check the status to see if it failed to execute the command
+                if (WEXITSTATUS(wstatus) != 0) {
+                    printf("Child process existed but did not run command\n");
+                    return false;
+                }
+            }
+            else {
+                // Child process did not end correctly
+                return false;
+            }
+        }
+    }
 
     va_end(args);
 
+    printf("Hit final return\n");
     return true;
 }
 
@@ -74,15 +127,12 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     va_list args;
     va_start(args, count);
     char * command[count+1];
-    int i;
+    int i, childPID, wstatus;
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
 
 
 /*
@@ -92,8 +142,62 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+    int fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+    if (fd < 0) {
+        printf("Failed to open redirect file.\n");
+        return false;
+    }
+
+    fflush(stdout);
+
+    printf("Forking\n");
+    if ((childPID = fork()) == -1) {
+        //failed to fork
+        printf("Fork failed\n");
+        return false;
+    }
+    else if (childPID == 0) {
+        // Child Process
+        printf("Child process about to run command\n");
+
+        if (dup2(fd, 1) < 0) {
+            printf("Failed to duplicate file descriptor\n");
+            _exit(1);
+        }
+        close(fd);
+        if (execv(command[0], command) == -1) {
+            // Failed to run execv syscall
+            printf("execv command failed to run\n");
+            _exit(1);
+        }
+    }
+    else {
+        // Parent Process
+        printf("Parent process waiting\n");
+        close(fd);
+        if (wait(&wstatus) == -1) {
+            // Wait failed
+            printf("Wait failed\n");
+            return false;
+        }
+        else {
+            if (WIFEXITED(wstatus) != 0) {
+                // Child process ended correctly
+                // Check the status to see if it failed to execute the command
+                if (WEXITSTATUS(wstatus) != 0) {
+                    printf("Child process existed but did not run command\n");
+                    return false;
+                }
+            }
+            else {
+                // Child process did not end correctly
+                return false;
+            }
+        }
+    }
 
     va_end(args);
 
+    printf("Hit final return\n");
     return true;
 }
