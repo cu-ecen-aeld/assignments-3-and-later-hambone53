@@ -55,12 +55,12 @@ rm -rf /tmp/aeld-data
 
 echo ${OUTPUTSTRING} > "/tmp/assignment4-result.txt"
 
-# set +e	# unsets that shell script error out whenever command does
-# echo ${OUTPUTSTRING} | grep "${MATCHSTR}"
-# if [ $? -eq 0 ]; then
-# 	echo "success" > "/tmp/assignment4-result.txt"
-# 	exit 0
-# else
-# 	echo "failed: expected  ${MATCHSTR} in ${OUTPUTSTRING} but instead found" > "/tmp/assignment4-result.txt"
-# 	exit 1
-# fi
+set +e	# unsets that shell script error out whenever command does
+echo ${OUTPUTSTRING} | grep "${MATCHSTR}"
+if [ $? -eq 0 ]; then
+	echo "success"
+	exit 0
+else
+	echo "failed: expected  ${MATCHSTR} in ${OUTPUTSTRING} but instead found"
+	exit 1
+fi
