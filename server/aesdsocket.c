@@ -11,20 +11,44 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <sys/queue.h>
+#include <stdbool.h>
+#include <pthread.h>
+#include <time.h>
 
 // Defines
 #define SERVER_PORT     "9000"
 #define BACK_LOG        10
 #define TEMP_FILE       "/var/tmp/aesdsocketdata"
 #define MAX_BUF_SIZE    512
+#define DEBUG_LOG(msg,...) printf("threading: " msg "\n" , ##__VA_ARGS__)
+#define ERROR_LOG(msg,...) printf("threading ERROR: " msg "\n" , ##__VA_ARGS__)
+#define TIME_STAMP_SEC 10
 
 // Types
+// SLIST.
+typedef struct slist_data_s slist_data_t;
+struct slist_data_s {
+    pthread_t thread;
+    pthread_mutex_t *file_mutex;
+    FILE *fp;
+    int socket;
+    bool thread_complete_success;
+    SLIST_ENTRY(slist_data_s) entries;
+};
+
+struct timer_thread_data
+{
+    FILE *fp;
+    pthread_mutex_t *file_mutex;
+};
 
 // File Private Vars
 static int ShutdownNow = 0;
 
 // File private function prototypes
 char * recv_dynamic(int s);
+void* threadfunc(void* thread_param);
 
 /********************************************************************
 *********************************************************************/
@@ -93,6 +117,93 @@ void signal_handler(int s) {
     }
 }
 
+/**
+* A thread which runs every timer_period_ms milliseconds
+* Assumes timer_create has configured for sigval.sival_ptr to point to the
+* thread data used for the timer
+*/
+static void timer_thread ( union sigval sigval )
+{
+    int mutex_rc, rc;
+    struct timer_thread_data *td = (struct timer_thread_data*) sigval.sival_ptr;
+    FILE *fp = td->fp;
+    struct timespec ts_realtime;
+    char timeString[200];
+    char timeStamp[300];
+    struct tm tm;
+
+    mutex_rc = pthread_mutex_lock(td->file_mutex);
+
+    if (mutex_rc != 0) {
+        ERROR_LOG("Failed to acquire file mutex.");
+        pthread_exit(NULL);
+    }
+
+    rc = clock_gettime(CLOCK_REALTIME, &ts_realtime);
+    if (rc != 0) {
+        ERROR_LOG("Failed to get realtime clock.");
+    }
+
+    if ( gmtime_r(&ts_realtime.tv_sec, &tm) == NULL ) {
+        ERROR_LOG("Error calling gmtimer_r with time %ld",ts_realtime.tv_sec);
+    } else {
+        if ( strftime(timeString, sizeof(timeString), "%a, %d %b %y %T %z", &tm) == 0 ) {
+            ERROR_LOG("Error converting string with strftime got: %i, %i, %i, %s", tm.tm_sec, tm.tm_year, tm.tm_mon, tm.tm_zone);
+        }
+    }
+
+    sprintf(timeStamp, "timestamp:%s\n", timeString);
+
+    if ( fputs(timeStamp, fp) == EOF ) {
+        ERROR_LOG("Failed to write to the storage file");
+    }
+
+    pthread_mutex_unlock(td->file_mutex);
+}
+
+/**
+* set @param result with @param ts_1 + @param ts_2
+*/
+static void timespec_add( struct timespec *result,
+                        const struct timespec *ts_1, const struct timespec *ts_2)
+{
+    result->tv_sec = ts_1->tv_sec + ts_2->tv_sec;
+    result->tv_nsec = ts_1->tv_nsec + ts_2->tv_nsec;
+    if( result->tv_nsec > 1000000000L ) {
+        result->tv_nsec -= 1000000000L;
+        result->tv_sec ++;
+    }
+}
+
+/**
+* Setup the timer at @param timerid (previously created with timer_create) to fire
+* every @param timer_period_ms milliseconds, using @param clock_id as the clock reference.
+* The time now is saved in @param start_time
+* @return true if the timer could be setup successfuly, false otherwise
+*/
+static bool setup_timer( int clock_id,
+                         timer_t timerid, unsigned int timer_period_sec,
+                         struct timespec *start_time)
+{
+    bool success = false;
+    if ( clock_gettime(clock_id,start_time) != 0 ) {
+        printf("Error %d (%s) getting clock %d time\n",errno,strerror(errno),clock_id);
+    } else {
+        struct itimerspec itimerspec;
+        memset(&itimerspec, 0, sizeof(struct itimerspec));
+        itimerspec.it_interval.tv_sec = timer_period_sec;
+        itimerspec.it_interval.tv_nsec = 0;
+        timespec_add(&itimerspec.it_value,start_time,&itimerspec.it_interval);
+        if( timer_settime(timerid, TIMER_ABSTIME, &itimerspec, NULL ) != 0 ) {
+            printf("Error %d (%s) setting timer\n",errno,strerror(errno));
+            // printf("timer_settime args ")
+        } else {
+            success = true;
+        }
+    }
+    return success;
+}
+
 
 /********************************************************************
 *********************************************************************/
@@ -101,15 +212,26 @@ int main( int argc, char *argv[] ) {
     struct addrinfo hints, *serverinfo, *tempP;
     struct sockaddr_storage clientAddr;
     socklen_t sockSize;
-    int rv, numBytes;
+    int rv;
     int yes = 1, run_as_daemon = 0;
-    char s[INET6_ADDRSTRLEN], newline = '\n';
+    char s[INET6_ADDRSTRLEN];
     FILE *fp;
-    char *recvBuffer, *line;
-    long fileWritePos;
     struct sigaction new_action;
+    slist_data_t *datap=NULL;
+    pthread_mutex_t file_mutex;
+    struct timer_thread_data td;
+    struct sigevent sev;
+    timer_t timerid;
 
     openlog("aesdsocket", LOG_CONS, LOG_USER);
+
+    // Init the linked list that will keep thread info
+    SLIST_HEAD(slisthead, slist_data_s) head;
+    SLIST_INIT(&head);
+
+    if ( (rv = pthread_mutex_init(&file_mutex, NULL)) != 0) {
+        syslog(LOG_ERR, "Error failed to init file mutex with code: %i", rv);
+    }
 
     // Check if we should run as a daemon
     if ( argc >= 2 ) {
@@ -130,20 +252,22 @@ int main( int argc, char *argv[] ) {
 
     if ( sigaction(SIGTERM, &new_action, NULL) != 0 ) {
         syslog(LOG_ERR, "Error (%s) registering for SIGTERM", strerror(errno));
-        fprintf(stderr, "Error (%s) registering for SIGTERM", strerror(errno));
         return -1;
     }
 
     if ( sigaction(SIGINT, &new_action, NULL) != 0 ) {
         syslog(LOG_ERR, "Error (%s) registering for SIGINT", strerror(errno));
-        fprintf(stderr, "Error (%s) registering for SIGINT", strerror(errno));
+        return -1;
+    }
+
+    if ( sigaction(SIGALRM, &new_action, NULL) != 0 ) {
+        syslog(LOG_ERR, "Error (%s) registering for SIGALRM", strerror(errno));
         return -1;
     }
 
     // Get the addrinfo for binding socket
     if ((rv = getaddrinfo(NULL, SERVER_PORT, &hints, &serverinfo)) != 0) {
         syslog(LOG_ERR, "Failed to getaddrinfo with error %s", gai_strerror(rv));
-        fprintf(stderr, "Failed to getaddrinfo with error %s", gai_strerror(rv));
         return -1;
     }
 
@@ -176,7 +300,6 @@ int main( int argc, char *argv[] ) {
 
     if (tempP == NULL) {
         syslog(LOG_ERR, "Failed to bind");
-        fprintf(stderr, "server: failed to bind\n");
         return -1;
     }
 
@@ -196,11 +319,31 @@ int main( int argc, char *argv[] ) {
     fp = fopen(TEMP_FILE, "w+");
     if( fp == NULL) {
         syslog(LOG_ERR, "Error opening file %s: %s\n", TEMP_FILE, strerror( errno ));
-        printf("Failed to open file %s for storage.\n", TEMP_FILE);
     }
 
     syslog(LOG_INFO, "Waiting for connections");
-    //printf("Server: waiting for connections...\n");
+
+    /* Configure a 10 second timer */
+    memset(&td, 0, sizeof(struct timer_thread_data));
+    td.file_mutex = &file_mutex;
+    td.fp = fp;
+    memset(&sev, 0, sizeof(struct sigevent));
+    sev.sigev_notify = SIGEV_THREAD;
+    sev.sigev_value.sival_ptr = &td;
+    sev.sigev_notify_function = timer_thread;
+
+    int clock_id = CLOCK_MONOTONIC;
+    struct timespec start_time;
+
+    if ( timer_create(clock_id, &sev, &timerid) != 0 ) {
+        syslog(LOG_ERR, "Failed to create time stamp timer.");
+        ShutdownNow = 1;
+    } else {
+        if (!setup_timer(clock_id, timerid, TIME_STAMP_SEC, &start_time)) {
+            syslog(LOG_ERR, "Failed to create time stamp timer.");
+            ShutdownNow = 1;
+        }
+    }
 
     while(!ShutdownNow) {
         // Accept incoming connections
@@ -215,55 +358,30 @@ int main( int argc, char *argv[] ) {
         //printf("Accepted connection from %s\n",s);
         syslog(LOG_INFO, "Accepted connection from %s", s);
 
-        // Recv data
-        if (( recvBuffer = recv_dynamic(newSockfd) ) == NULL) {
-            printf("Got NULL when trying to recv\n");
+        datap = malloc(sizeof(slist_data_t));
+        datap->file_mutex = &file_mutex;
+        datap->fp = fp;
+        datap->socket = newSockfd;
+        datap->thread_complete_success = false;
+
+        SLIST_INSERT_HEAD(&head, datap, entries);
+
+        rv = pthread_create(&datap->thread, NULL, threadfunc, (void *)datap);
+        if (rv != 0) {
+            syslog(LOG_ERR, "Failed to start thread.");
             ShutdownNow = 1;
             continue;
         }
 
-        if ( fputs(recvBuffer, fp) == EOF ) {
-            syslog(LOG_ERR, "Failed to write to the storage file");
-            printf("Failed to write to the storage file");
-        }
-
-        free(recvBuffer);
-        
-        // Need to reply with full content what we have in file storage.
-        fileWritePos = ftell(fp);
-        rewind(fp);
-
-        // Note: read_line will malloc a new char pointer so need to free when done.
-        while ( (line = read_line( fp )) ) {
-            numBytes = strlen(line);
-
-            if ( numBytes != 0) {
-                if ( (sendAll(newSockfd, line, &numBytes) == -1) ) {
-                    syslog(LOG_ERR, "Failed to send file to client!");
-                    printf("Failed to send file to client");
-                    free(line);
-                    return -1;
+        SLIST_FOREACH(datap, &head, entries) {
+            if (datap->thread_complete_success) {
+                if ( pthread_join(datap->thread, NULL) != 0 ) {
+                    syslog(LOG_ERR, "Failed to join thread with error.");
                 }
-
-
-                free(line);
-
-                // Handle the need for new line
-                numBytes = 1;
-                if ( (sendAll(newSockfd, &newline, &numBytes) == -1) ) {
-                    syslog(LOG_ERR, "Failed to send file to client!");
-                    printf("Failed to send file to client");
-                    return -1;
-                }
+                SLIST_REMOVE(&head, datap, slist_data_s, entries);
+                free(datap);
             }
-
         }
-
-        fseek(fp, fileWritePos, SEEK_SET);  // To position we were last writing at.
-        close(newSockfd);
-        //printf("Closed connection from %s\n",s);
-        syslog(LOG_INFO, "Closed connection from %s", s);
-
     }
 
     // Handle shutdown
@@ -274,6 +392,7 @@ int main( int argc, char *argv[] ) {
         if (newSockfd) {shutdown(newSockfd, SHUT_RDWR);}
         if (fp) {fclose(fp);}
         remove(TEMP_FILE);
+        timer_delete(timerid);
         closelog();
         return 0;
     }
@@ -315,7 +434,6 @@ char * recv_dynamic(int s) {
             }
         }
 
-
         if (size_recv > 0) {
             // printf("Recieved this much data %d\n", size_recv);
             memcpy(&p[pos], &chunk, size_recv);
@@ -334,4 +452,82 @@ char * recv_dynamic(int s) {
     }
 
     return p;
+}
+
+/*************************************************************************
+ * ***********************************************************************/
+void* threadfunc(void* thread_param) {
+    slist_data_t* thread_func_args = (slist_data_t *) thread_param;
+    int mutex_rc, numBytes;
+    int socket = thread_func_args->socket;
+    char *recvBuffer, *line;
+    FILE *fp = thread_func_args->fp;
+    long fileWritePos;
+    char newline = '\n';
+
+    // Recv data
+    if (( recvBuffer = recv_dynamic(socket) ) == NULL) {
+        ERROR_LOG("Got NULL when trying to recv.");
+        thread_func_args->thread_complete_success = true;
+        pthread_exit(NULL);
+    }
+
+    // Lock file and manipulate
+    mutex_rc = pthread_mutex_lock(thread_func_args->file_mutex);
+
+    if (mutex_rc != 0) {
+        ERROR_LOG("Failed to acquire file mutex.");
+        free(recvBuffer);
+        thread_func_args->thread_complete_success = true;
+        pthread_exit(NULL);
+    }
+
+    if ( fputs(recvBuffer, fp) == EOF ) {
+        ERROR_LOG("Failed to write to the storage file");
+        free(recvBuffer);
+        (void)pthread_mutex_unlock(thread_func_args->file_mutex);
+        thread_func_args->thread_complete_success = true;
+        pthread_exit(NULL);
+    } else {
+        free(recvBuffer);
+    }
+    
+    // Need to reply with full content what we have in file storage.
+    fileWritePos = ftell(fp);
+    rewind(fp);
+
+    // Note: read_line will malloc a new char pointer so need to free when done.
+    while ( (line = read_line( fp )) ) {
+        numBytes = strlen(line);
+
+        if ( numBytes != 0) {
+            if ( (sendAll(socket, line, &numBytes) == -1) ) {
+                ERROR_LOG("Failed to send file to client!");
+                free(line);
+                (void)pthread_mutex_unlock(thread_func_args->file_mutex);
+                thread_func_args->thread_complete_success = true;
+                pthread_exit(NULL);
+            } else {
+                free(line);
+            }
+
+            // Handle the need for new line
+            numBytes = 1;
+            if ( (sendAll(socket, &newline, &numBytes) == -1) ) {
+                ERROR_LOG("Failed to send file to client!");
+                (void)pthread_mutex_unlock(thread_func_args->file_mutex);
+                thread_func_args->thread_complete_success = true;
+                pthread_exit(NULL);
+            }
+        } else {
+            free(line);
+        }
+    }
+
+    fseek(fp, fileWritePos, SEEK_SET);  // To position we were last writing at.
+    close(socket);
+    DEBUG_LOG("Closed connection from %i", socket);
+    (void)pthread_mutex_unlock(thread_func_args->file_mutex);
+    thread_func_args->thread_complete_success = true;
+    pthread_exit(NULL);
 }
