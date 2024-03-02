@@ -60,12 +60,13 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
 * new start location.
 * Any necessary locking must be handled by the caller
 * Any memory referenced in @param add_entry must be allocated by and/or must have a lifetime managed by the caller.
+* @return NULL or, if an existing entry at out_offs was replaced then return
+* the value of buffptr for the entry which was replaced (for use with dynamic memory allocation/free)
 */
-void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry)
+const char *aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry)
 {
-    /**
-    * TODO: implement per description
-    */
+    const char *ret_buffptr = NULL;
+
     if ( buffer->entry[buffer->in_offs].buffptr == NULL ) {
         // We have an entry available assign it and move pointers
         // Update the buffptr value with the value from add_entry
@@ -80,10 +81,13 @@ void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const s
         }
     } else {
         // We are overwriting an entry, move the out offset
+        ret_buffptr = buffer->entry[buffer->out_offs].buffptr;
         buffer->entry[buffer->in_offs].buffptr = add_entry->buffptr;
         buffer->entry[buffer->in_offs].size = add_entry->size;
         buffer->out_offs = (buffer->out_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
     }
+
+    return ret_buffptr;
 }
 
 /**
