@@ -90,6 +90,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 {
     ssize_t retval = -ENOMEM;
     size_t previous_count = 0;
+    const char* ret_buffptr = NULL;
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
 
     if (mutex_lock_interruptible(&aesd_device.lock))
@@ -126,14 +127,16 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 
     // Check if the last character is a newline
     if (aesd_device.working_entry[(count + previous_count) - 1] == '\n') {
-        // If it is a newline then we can add the entry to the circular buffer
-        // If the buffer does not return a null pointer we need to free the pointer it returns
-        if (aesd_circular_buffer_add_entry(&aesd_device.circular_buffer, &(struct aesd_buffer_entry) {
+        // If it is a newline then we can add the entry to the circular buffer.
+        // Add the entry to the circular buffer and free the working entry regarless of return value
+        ret_buffptr = aesd_circular_buffer_add_entry(&aesd_device.circular_buffer, &(struct aesd_buffer_entry) {
             .buffptr = aesd_device.working_entry,
             .size = count + previous_count
-        }) != NULL) {
-            kfree(aesd_device.working_entry);
+        });
+        if (ret_buffptr != NULL) {
+            kfree(ret_buffptr);
         }
+        aesd_device.working_entry = NULL;
     }
 
     // If we get here then we have successfully written to the buffer so return count
