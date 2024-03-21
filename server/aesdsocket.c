@@ -17,13 +17,16 @@
 #include <time.h>
 
 // Defines
+#define USE_AESD_CHAR_DEVICE 1  // Set to 1 to use the char device and no timestamps, 0 to use file and timestamps
 #define SERVER_PORT     "9000"
 #define BACK_LOG        10
 #define TEMP_FILE       "/var/tmp/aesdsocketdata"
+#define AESD_DEVICE     "/dev/aesdchar"
 #define MAX_BUF_SIZE    512
 #define DEBUG_LOG(msg,...) printf("threading: " msg "\n" , ##__VA_ARGS__)
 #define ERROR_LOG(msg,...) printf("threading ERROR: " msg "\n" , ##__VA_ARGS__)
 #define TIME_STAMP_SEC 10
+#define AESD_CHAR_DEVICE_READ_SIZE 0x20000
 
 // Types
 // SLIST.
@@ -31,16 +34,14 @@ typedef struct slist_data_s slist_data_t;
 struct slist_data_s {
     pthread_t thread;
     pthread_mutex_t *file_mutex;
+#if !defined(USE_AESD_CHAR_DEVICE)
     FILE *fp;
+#else
+    int fp;
+#endif // USE_AESD_CHAR_DEVICE
     int socket;
     bool thread_complete_success;
     SLIST_ENTRY(slist_data_s) entries;
-};
-
-struct timer_thread_data
-{
-    FILE *fp;
-    pthread_mutex_t *file_mutex;
 };
 
 // File Private Vars
@@ -49,6 +50,14 @@ static int ShutdownNow = 0;
 // File private function prototypes
 char * recv_dynamic(int s);
 void* threadfunc(void* thread_param);
+
+#if !defined(USE_AESD_CHAR_DEVICE)
+struct timer_thread_data
+{
+    FILE *fp;
+    pthread_mutex_t *file_mutex;
+};
+#endif // USE_AESD_CHAR_DEVICE
 
 /********************************************************************
 *********************************************************************/
@@ -117,6 +126,7 @@ void signal_handler(int s) {
     }
 }
 
+#if !defined(USE_AESD_CHAR_DEVICE)
 /**
 * A thread which runs every timer_period_ms milliseconds
 * Assumes timer_create has configured for sigval.sival_ptr to point to the
@@ -203,7 +213,7 @@ static bool setup_timer( int clock_id,
     }
     return success;
 }
-
+#endif // USE_AESD_CHAR_DEVICE
 
 /********************************************************************
 *********************************************************************/
@@ -215,13 +225,19 @@ int main( int argc, char *argv[] ) {
     int rv;
     int yes = 1, run_as_daemon = 0;
     char s[INET6_ADDRSTRLEN];
+#if !defined(USE_AESD_CHAR_DEVICE)
     FILE *fp;
+#else
+    int fp;
+#endif // USE_AESD_CHAR_DEVICE
     struct sigaction new_action;
     slist_data_t *datap=NULL;
     pthread_mutex_t file_mutex;
-    struct timer_thread_data td;
+#if !defined(USE_AESD_CHAR_DEVICE)
     struct sigevent sev;
+    struct timer_thread_data td;
     timer_t timerid;
+#endif // USE_AESD_CHAR_DEVICE
 
     openlog("aesdsocket", LOG_CONS, LOG_USER);
 
@@ -316,13 +332,22 @@ int main( int argc, char *argv[] ) {
     }
 
     // Setup temp file to log to cleaning out whatever is there already.
+#if !defined(USE_AESD_CHAR_DEVICE)
     fp = fopen(TEMP_FILE, "w+");
     if( fp == NULL) {
         syslog(LOG_ERR, "Error opening file %s: %s\n", TEMP_FILE, strerror( errno ));
     }
+#else
+    fp = 0;
+    // fp = open(AESD_DEVICE, O_RDWR);
+    // if( fp == -1) {
+    //     syslog(LOG_ERR, "Error opening device %s: %s\n", AESD_DEVICE, strerror( errno ));
+    // }
+#endif // USE_AESD_CHAR_DEVICE
 
     syslog(LOG_INFO, "Waiting for connections");
 
+#if !defined(USE_AESD_CHAR_DEVICE)
     /* Configure a 10 second timer */
     memset(&td, 0, sizeof(struct timer_thread_data));
     td.file_mutex = &file_mutex;
@@ -344,6 +369,7 @@ int main( int argc, char *argv[] ) {
             ShutdownNow = 1;
         }
     }
+#endif // USE_AESD_CHAR_DEVICE
 
     while(!ShutdownNow) {
         // Accept incoming connections
@@ -390,9 +416,15 @@ int main( int argc, char *argv[] ) {
         //printf("Caught signal, exiting\n");
         if (listenSockfd) {shutdown(listenSockfd, SHUT_RDWR);}
         if (newSockfd) {shutdown(newSockfd, SHUT_RDWR);}
-        if (fp) {fclose(fp);}
         remove(TEMP_FILE);
+        pthread_mutex_destroy(&file_mutex);
+#if !defined(USE_AESD_CHAR_DEVICE)
         timer_delete(timerid);
+        if (fp) {fclose(fp);};
+#else
+        if (fp) {close(fp);};
+#endif // USE_AESD_CHAR_DEVICE
+
         closelog();
         return 0;
     }
@@ -461,9 +493,14 @@ void* threadfunc(void* thread_param) {
     int mutex_rc, numBytes;
     int socket = thread_func_args->socket;
     char *recvBuffer, *line;
+#if !defined(USE_AESD_CHAR_DEVICE)
     FILE *fp = thread_func_args->fp;
     long fileWritePos;
     char newline = '\n';
+#else
+    int fp = thread_func_args->fp;
+#endif // USE_AESD_CHAR_DEVICE
+
 
     // Recv data
     if (( recvBuffer = recv_dynamic(socket) ) == NULL) {
@@ -482,8 +519,21 @@ void* threadfunc(void* thread_param) {
         pthread_exit(NULL);
     }
 
+#if !defined(USE_AESD_CHAR_DEVICE)
     if ( fputs(recvBuffer, fp) == EOF ) {
-        ERROR_LOG("Failed to write to the storage file");
+#else
+    fp = open(AESD_DEVICE, O_RDWR);
+    if( fp == -1) {
+        ERROR_LOG("Error opening device %s: %s\n", AESD_DEVICE, strerror( errno ));
+        free(recvBuffer);
+        (void)pthread_mutex_unlock(thread_func_args->file_mutex);
+        thread_func_args->thread_complete_success = true;
+        pthread_exit(NULL);
+    }
+
+    if ( write(fp, recvBuffer, strlen(recvBuffer)) == -1 ) {
+#endif // USE_AESD_CHAR_DEVICE
+        ERROR_LOG("Failed to write to the storage device.");
         free(recvBuffer);
         (void)pthread_mutex_unlock(thread_func_args->file_mutex);
         thread_func_args->thread_complete_success = true;
@@ -491,18 +541,18 @@ void* threadfunc(void* thread_param) {
     } else {
         free(recvBuffer);
     }
-    
+
+#if !defined(USE_AESD_CHAR_DEVICE)
     // Need to reply with full content what we have in file storage.
     fileWritePos = ftell(fp);
     rewind(fp);
 
-    // Note: read_line will malloc a new char pointer so need to free when done.
     while ( (line = read_line( fp )) ) {
         numBytes = strlen(line);
 
         if ( numBytes != 0) {
             if ( (sendAll(socket, line, &numBytes) == -1) ) {
-                ERROR_LOG("Failed to send file to client!");
+                ERROR_LOG("Failed to send %i bytes to client!", numBytes);
                 free(line);
                 (void)pthread_mutex_unlock(thread_func_args->file_mutex);
                 thread_func_args->thread_complete_success = true;
@@ -523,8 +573,40 @@ void* threadfunc(void* thread_param) {
             free(line);
         }
     }
+#else
+    // Allocate memory for the line variable to read from fp and handle errors
+    line = malloc(AESD_CHAR_DEVICE_READ_SIZE);
 
+    if ( line == NULL ) {
+        ERROR_LOG("Failed to allocate memory for reading from storage device.");
+        (void)pthread_mutex_unlock(thread_func_args->file_mutex);
+        thread_func_args->thread_complete_success = true;
+        pthread_exit(NULL);
+    }
+
+    while ( (numBytes = read(fp, line, AESD_CHAR_DEVICE_READ_SIZE)) ) {
+        if ( numBytes != 0) {
+            if ( (sendAll(socket, line, &numBytes) == -1) ) {
+                ERROR_LOG("Failed to send %i bytes to client!", numBytes);
+                free(line);
+                (void)pthread_mutex_unlock(thread_func_args->file_mutex);
+                thread_func_args->thread_complete_success = true;
+                pthread_exit(NULL);
+            }
+        }
+    }
+
+    if (line) {
+        free(line);
+    }
+
+#endif // USE_AESD_CHAR_DEVICE
+
+#if !defined(USE_AESD_CHAR_DEVICE)
     fseek(fp, fileWritePos, SEEK_SET);  // To position we were last writing at.
+#else
+    close(fp);
+#endif // USE_AESD_CHAR_DEVICE
     close(socket);
     DEBUG_LOG("Closed connection from %i", socket);
     (void)pthread_mutex_unlock(thread_func_args->file_mutex);
