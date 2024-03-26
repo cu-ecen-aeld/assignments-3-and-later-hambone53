@@ -11,6 +11,26 @@ endif
 
 EXTRA_CFLAGS += $(DEBFLAGS)
 
+# Make steps for yocto
+ifneq ($(KERNEL_SRC),)
+obj-m := aesdchar.o
+aesdchar-y := aesd-circular-buffer.o main.o
+
+SRC := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KERNEL_SRC) M=$(SRC)
+
+modules_install:
+	$(MAKE) -C $(KERNEL_SRC) M=$(SRC) modules_install
+
+clean:
+	rm -f *.o *~ core .depend .*.cmd *.ko *.mod.c
+	rm -f Module.markers Module.symvers modules.order
+	rm -rf .tmp_versions Modules.symvers
+
+else	# Make steps non-yocto
+
 ifneq ($(KERNELRELEASE),)
 # call from kernel build system
 obj-m	:= aesdchar.o
@@ -28,3 +48,4 @@ endif
 clean:
 	rm -rf *.o *~ core .depend .*.cmd *.ko *.mod.c .tmp_versions
 
+endif # KERNEL_SRC
