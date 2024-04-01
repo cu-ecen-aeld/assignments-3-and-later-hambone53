@@ -89,7 +89,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
 {
     ssize_t retval = -ENOMEM;
-    size_t previous_count = 0;
+    static size_t previous_count = 0;
     const char* ret_buffptr = NULL;
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
 
@@ -107,8 +107,8 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         memset(aesd_device.working_entry, 0, count);
     } else {
         // If it is not NULL that means we are still appending to the buffer so reallocate more memory
-        previous_count = strlen(aesd_device.working_entry);
-        char *temp = krealloc(aesd_device.working_entry, count, GFP_KERNEL);
+        //previous_count = strlen(aesd_device.working_entry);
+        char *temp = krealloc(aesd_device.working_entry, previous_count + count, GFP_KERNEL);
         if (temp == NULL) {
             PDEBUG("Failed to reallocate memory for working_entry");
             retval = -ENOMEM;
@@ -135,8 +135,13 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         });
         if (ret_buffptr != NULL) {
             kfree(ret_buffptr);
+            ret_buffptr = NULL;
         }
         aesd_device.working_entry = NULL;
+        previous_count = 0;
+    } else {
+        // If the last character is not a newline then we need to keep track of the count
+        previous_count += count;
     }
 
     // If we get here then we have successfully written to the buffer so return count
@@ -146,6 +151,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 
     exit_cleanup_working_entry:
     kfree(aesd_device.working_entry);
+    aesd_device.working_entry = NULL;
 
     exit_return:
     mutex_unlock(&aesd_device.lock);
