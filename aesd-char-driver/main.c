@@ -19,6 +19,7 @@
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -158,10 +159,105 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     return retval;
 }
 
+/* The function below implements "extended" operation of seek */
+loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
+{
+    struct aesd_dev *dev = filp->private_data;
+    loff_t newpos;
+    struct aesd_buffer_entry *entry;
+    uint8_t index;
+    size_t char_offset_bytes = 0;
+
+    switch(whence) {
+        case 0: /* SEEK_SET: */
+            newpos = off;
+            break;
+
+        case 1: /* SEEK_CUR: */
+            newpos = filp->f_pos + off;
+            break;
+
+        case 2: /* SEEK_END: */
+            // TODO: since circular buffer is not a file, we have to calulate the end by summing the size of each non-null buffer entry
+            AESD_CIRCULAR_BUFFER_FOREACH(entry, &dev->circular_buffer, index) {
+                if (entry->buffptr != NULL) {
+                    char_offset_bytes += entry->size;
+                }
+            }
+            newpos = char_offset_bytes + off;
+            break;
+
+        default: /* can't happen */
+            return -EINVAL;
+    }
+    if (newpos < 0) return -EINVAL;
+    filp->f_pos = newpos;
+    return newpos;
+}
+
+/*
+ * The ioctl() implementation
+ */
+
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    int retval = 0;
+    struct aesd_dev *dev = filp->private_data;
+    struct aesd_seekto seekto;
+    int i = 0;
+    int index = 0;
+    int write_cmd_size = 0;
+
+    switch (cmd) {
+        case AESDCHAR_IOCSEEKTO:
+            if (copy_from_user(&seekto, (struct aesd_seekto *)arg, sizeof(struct aesd_seekto))) {
+                return -EFAULT;
+            }
+
+            // Make sure the write_cmd is within bounds
+            if (seekto.write_cmd >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
+                return -EINVAL;
+            }
+
+            // Get the number of bytes in all the entries up to the write_cmd entry and make sure all those previous entries are not null or else return -EINVAL
+            for ( i=0; i < seekto.write_cmd; i++) {
+                index = (dev->circular_buffer.out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+                if ( dev->circular_buffer.entry[index].buffptr == NULL ) {
+                    return -EINVAL;
+                }
+                write_cmd_size += dev->circular_buffer.entry[index].size;
+            }
+
+            // Check that the write_cmd entry offset from the out_offs is not null
+            index = (dev->circular_buffer.out_offs + seekto.write_cmd) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+            if ( dev->circular_buffer.entry[index].buffptr == NULL ) {
+                return -EINVAL;
+            }
+
+            // Check that the write_cmd entry offset form the out_offs is less than or equial to write_cmd_offset in size else return -EINVAL
+            if (seekto.write_cmd_offset > dev->circular_buffer.entry[index].size) {
+                return -EINVAL;
+            }
+
+            write_cmd_size += seekto.write_cmd_offset;
+
+            filp->f_pos = write_cmd_size;
+            break;
+
+        default:
+            return -ENOTTY;
+    }
+
+    return retval;
+   
+}
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
+    .llseek =   aesd_llseek,
     .read =     aesd_read,
     .write =    aesd_write,
+    .unlocked_ioctl = aesd_ioctl,
     .open =     aesd_open,
     .release =  aesd_release,
 };

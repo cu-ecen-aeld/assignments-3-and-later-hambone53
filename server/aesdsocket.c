@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <time.h>
+#include "aesd_ioctl.h"
 
 // Defines
 #define USE_AESD_CHAR_DEVICE 1  // Set to 1 to use the char device and no timestamps, 0 to use file and timestamps
@@ -27,6 +28,7 @@
 #define ERROR_LOG(msg,...) printf("threading ERROR: " msg "\n" , ##__VA_ARGS__)
 #define TIME_STAMP_SEC 10
 #define AESD_CHAR_DEVICE_READ_SIZE 0x20000
+#define IOCSEEKTO_CMD   "AESDCHAR_IOCSEEKTO:"
 
 // Types
 // SLIST.
@@ -531,15 +533,51 @@ void* threadfunc(void* thread_param) {
         pthread_exit(NULL);
     }
 
-    if ( write(fp, recvBuffer, strlen(recvBuffer)) == -1 ) {
-#endif // USE_AESD_CHAR_DEVICE
-        ERROR_LOG("Failed to write to the storage device.");
+    // Check if the recvBuffer starts with the string as for the cmd IOCSEEKTO_CMD after that string the write_command is first integer before a comma and the write_cmd_offset is the second after the comma
+    if ( strncmp(recvBuffer, IOCSEEKTO_CMD, strlen(IOCSEEKTO_CMD)) == 0 ) {
+        char *write_command = strtok(recvBuffer + strlen(IOCSEEKTO_CMD), ",");
+        char *write_cmd_offset = strtok(NULL, ",");
+        if ( write_command == NULL || write_cmd_offset == NULL ) {
+            ERROR_LOG("Failed to parse the write command and offset.");
+            free(recvBuffer);
+            (void)pthread_mutex_unlock(thread_func_args->file_mutex);
+            thread_func_args->thread_complete_success = true;
+            pthread_exit(NULL);
+        }
+
+        // Convert the write_command and write_cmd_offset to integers
+        int write_command_int = atoi(write_command);
+        int write_cmd_offset_int = atoi(write_cmd_offset);
+
+        // Create aesd_seekto struct to pass to the device
+        struct aesd_seekto seekto;
+        seekto.write_cmd = write_command_int;
+        seekto.write_cmd_offset = write_cmd_offset_int;
+
+        // Using ioctl to seek to the write command and offset
+        if ( ioctl(fp, AESDCHAR_IOCSEEKTO, &seekto) == -1 ) {
+            ERROR_LOG("Failed to seek to the write command and offset.");
+            free(recvBuffer);
+            (void)pthread_mutex_unlock(thread_func_args->file_mutex);
+            thread_func_args->thread_complete_success = true;
+            pthread_exit(NULL);
+        }
+
+        //free the recvBuffer
         free(recvBuffer);
-        (void)pthread_mutex_unlock(thread_func_args->file_mutex);
-        thread_func_args->thread_complete_success = true;
-        pthread_exit(NULL);
     } else {
-        free(recvBuffer);
+
+        // Write the recvBuffer to the device as this was not a seek command
+        if ( write(fp, recvBuffer, strlen(recvBuffer)) == -1 ) {
+    #endif // USE_AESD_CHAR_DEVICE
+            ERROR_LOG("Failed to write to the storage device.");
+            free(recvBuffer);
+            (void)pthread_mutex_unlock(thread_func_args->file_mutex);
+            thread_func_args->thread_complete_success = true;
+            pthread_exit(NULL);
+        } else {
+            free(recvBuffer);
+        }
     }
 
 #if !defined(USE_AESD_CHAR_DEVICE)
